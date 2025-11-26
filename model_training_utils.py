@@ -149,19 +149,23 @@ def clean_outliers(series: pd.Series,
     
     return cleaned
 
-def preprocess_data(X, cat_cols, num_cols, artifacts=None, fit=True):
+def preprocess_data(X: pd.DataFrame, 
+                    cat_cols: list[str], 
+                    num_cols: dict[str, str], 
+                    artifacts: dict | None = None, 
+                    fit: bool = True) -> pd.DataFrame | tuple[pd.DataFrame, dict]:
     """
     Preprocess data using consistent transformations.
     
     Args:
-        X (pd.DataFrame): Features to preprocess
-        cat_cols (list): Categorical column names
-        num_cols (dict): Numerical column names with types
-        artifacts (dict): Preprocessing artifacts (if fit=False)
-        fit (bool): If True, fit transformers; if False, use provided artifacts
+        X (pd.DataFrame): Features to preprocess.
+        cat_cols (list[str]): Categorical column names.
+        num_cols (dict[str, str]): Numerical column names with types.
+        artifacts (dict | None): Preprocessing artifacts (if fit=False).
+        fit (bool): If True, fit transformers; if False, use provided artifacts.
         
     Returns:
-        tuple: (X_processed, artifacts) if fit=True, else X_processed
+        pd.DataFrame | tuple[pd.DataFrame, dict]: (X_processed, artifacts) if fit=True, else X_processed.
     """
     X = X.copy()
     continuous_cols = [col for col, var_type in num_cols.items() if var_type == 'continuous']
@@ -232,18 +236,18 @@ def preprocess_data(X, cat_cols, num_cols, artifacts=None, fit=True):
     
     return (X, artifacts) if fit else X
 
-def sample_hyperparameters(param_distributions, n_iter, seed):
+def sample_hyperparameters(param_distributions: dict, n_iter: int, seed: int) -> list[dict]:
     """
     Sample hyperparameters from distributions.
     
     Args:
         param_distributions (dict): Dictionary with parameter names as keys and
-                                   distributions/lists as values
-        n_iter (int): Number of parameter combinations to sample
-        seed (int): Random seed for reproducibility
+                                   distributions/lists as values.
+        n_iter (int): Number of parameter combinations to sample.
+        seed (int): Random seed for reproducibility.
         
     Returns:
-        list[dict]: List of parameter dictionaries
+        list[dict]: List of parameter dictionaries.
     """
     np.random.seed(seed)
     param_list = []
@@ -253,36 +257,53 @@ def sample_hyperparameters(param_distributions, n_iter, seed):
         for param_name, param_values in param_distributions.items():
             # Check if it's a scipy distribution (has .rvs method)
             if hasattr(param_values, 'rvs'):
-                params[param_name] = param_values.rvs(random_state=seed + i)
+                val = param_values.rvs(random_state=seed + i)
+                # Convert numpy types to python types
+                if isinstance(val, np.generic):
+                    val = val.item()
+                params[param_name] = val
             # Check if it's a list (discrete choices)
             elif isinstance(param_values, list):
-                params[param_name] = np.random.choice(param_values)
+                # Use random index to avoid issues with lists of tuples/objects
+                idx = np.random.randint(0, len(param_values))
+                val = param_values[idx]
+                # Convert numpy types to python types
+                if isinstance(val, np.generic):
+                    val = val.item()
+                params[param_name] = val
             else:
-                raise ValueError(f"Unknown parameter type for {param_name}")
+                # Assume it's a constant value (int, float, str, bool, etc.)
+                params[param_name] = param_values
         
         param_list.append(params)
     
     return param_list
 
-def cross_validate_with_tuning(X_raw, y_raw, cat_cols_list, num_cols_dict, model_config, k=3, seed=42):
+def cross_validate_with_tuning(X_raw: pd.DataFrame, 
+                               y_raw: pd.Series, 
+                               cat_cols_list: list[str], 
+                               num_cols_dict: dict[str, str], 
+                               model_config: dict, 
+                               k: int = 3, 
+                               seed: int = 42) -> dict:
     """
     Perform k-fold cross-validation with manual hyperparameter search.
     Preprocessing is done within each fold to prevent data leakage.
     
     Args:
-        X_raw (pd.DataFrame): Raw training features (not preprocessed)
-        y_raw (pd.Series): Raw training target (not log-transformed)
-        cat_cols_list (list): List of categorical column names
-        num_cols_dict (dict): Dictionary of numerical columns with types
+        X_raw (pd.DataFrame): Raw training features (not preprocessed).
+        y_raw (pd.Series): Raw training target (not log-transformed).
+        cat_cols_list (list[str]): List of categorical column names.
+        num_cols_dict (dict[str, str]): Dictionary of numerical columns with types.
         model_config (dict): Configuration dictionary with keys:
-            - 'model_class': sklearn model class (e.g., Ridge, Lasso, RandomForestRegressor)
-            - 'param_distributions': dict of parameter distributions for sampling
-            - 'n_iter': number of parameter settings to sample (default: 20)
-        k (int): Number of CV folds (default: 3)
-        seed (int): Random seed for reproducibility
+            - 'model_class': sklearn model class (e.g., Ridge, Lasso, RandomForestRegressor).
+            - 'param_distributions': dict of parameter distributions for sampling.
+            - 'n_iter': number of parameter settings to sample (default: 20).
+        k (int): Number of CV folds (default: 3).
+        seed (int): Random seed for reproducibility.
         
     Returns:
-        dict: Results with best_params, best_estimator, CV scores, and preprocessing artifacts
+        dict: Results with best_params, best_estimator, CV scores, and preprocessing artifacts.
     """
     # Setup CV
     kfold = KFold(n_splits=k, shuffle=True, random_state=seed)
@@ -295,10 +316,11 @@ def cross_validate_with_tuning(X_raw, y_raw, cat_cols_list, num_cols_dict, model
         seed
     )
     
-    # Storage for results
-    fold_results = []
-    best_score_overall = float('inf')
-    best_params_overall = None
+    # Storage for results: param_idx -> {fold_idx: {'val_mae': ..., 'train_mae': ...}}
+    param_results = {i: {'params': params, 'fold_scores': []} for i, params in enumerate(param_combinations)}
+    
+    # Store artifacts per fold to reconstruct fold_results later
+    fold_artifacts_list = {}
     
     print(f"Starting {k}-Fold CV with {model_config['model_class'].__name__} ({n_iter} hyperparam combinations)...")
     
@@ -319,15 +341,13 @@ def cross_validate_with_tuning(X_raw, y_raw, cat_cols_list, num_cols_dict, model
             artifacts=fold_artifacts, fit=False
         )
         
+        fold_artifacts_list[fold_idx] = fold_artifacts
+        
         # Log-transform target
         y_train_log = np.log1p(y_train_fold)
         
-        # Hyperparameter tuning: try each parameter combination
-        best_fold_score = float('inf')
-        best_fold_params = None
-        best_fold_model = None
-        
-        for params in param_combinations:
+        # Evaluate each parameter combination on this fold
+        for i, params in enumerate(param_combinations):
             # Train model with these parameters
             model = model_config['model_class'](**params)
             model.fit(X_train_processed, y_train_log)
@@ -335,44 +355,71 @@ def cross_validate_with_tuning(X_raw, y_raw, cat_cols_list, num_cols_dict, model
             # Predict on validation fold
             y_val_pred_log = model.predict(X_val_processed)
             y_val_pred = np.expm1(y_val_pred_log)
+            val_mae = mean_absolute_error(y_val_fold, y_val_pred)
             
-            # Calculate MAE
-            fold_mae = mean_absolute_error(y_val_fold, y_val_pred)
+            # Predict on train fold (for monitoring overfitting)
+            y_train_pred_log = model.predict(X_train_processed)
+            y_train_pred = np.expm1(y_train_pred_log)
+            train_mae = mean_absolute_error(y_train_fold, y_train_pred)
             
-            # Track best for this fold
-            if fold_mae < best_fold_score:
-                best_fold_score = fold_mae
-                best_fold_params = params
-                best_fold_model = model
+            # Store results
+            param_results[i]['fold_scores'].append({
+                'fold': fold_idx,
+                'val_mae': val_mae,
+                'train_mae': train_mae
+            })
+
+    # Calculate stats for all parameter combinations
+    summary_data = []
+    for i, res in param_results.items():
+        val_maes = [s['val_mae'] for s in res['fold_scores']]
+        avg_val_mae = np.mean(val_maes)
+        std_val_mae = np.std(val_maes)
         
-        # Calculate train performance for best model
-        y_train_pred_log = best_fold_model.predict(X_train_processed)
-        y_train_pred = np.expm1(y_train_pred_log)
-        train_mae = mean_absolute_error(y_train_fold, y_train_pred)
+        row = {
+            'param_idx': i,
+            'mean_val_mae': avg_val_mae,
+            'std_val_mae': std_val_mae
+        }
+        # Flatten parameters into columns
+        row.update(res['params'])
         
-        # Store fold results
+        summary_data.append(row)
+    
+    # Create summary dataframe
+    summary_df = pd.DataFrame(summary_data)
+    
+    # Sort by mean validation MAE
+    summary_df = summary_df.sort_values('mean_val_mae')
+    
+    # Best is the first one
+    best_param_idx = int(summary_df.iloc[0]['param_idx'])
+    best_params_overall = param_combinations[best_param_idx]
+    
+    best_scores = param_results[best_param_idx]['fold_scores']
+    
+    # Construct fold_results for the best parameter set (for display/return)
+    fold_results = []
+    for score_data in best_scores:
+        fold_idx = score_data['fold']
         fold_results.append({
             'fold': fold_idx,
-            'best_params': best_fold_params,
-            'train_mae': train_mae,
-            'val_mae': best_fold_score,
-            'best_model': best_fold_model,
-            'artifacts': fold_artifacts
+            'best_params': best_params_overall, # Same for all folds now
+            'train_mae': score_data['train_mae'],
+            'val_mae': score_data['val_mae'],
+            'best_model': None, # We don't keep the fitted models to save memory
+            'artifacts': fold_artifacts_list[fold_idx]
         })
         
-        # Track overall best across all folds
-        if best_fold_score < best_score_overall:
-            best_score_overall = best_fold_score
-            best_params_overall = best_fold_params
-    
-    # Calculate mean and std of CV scores
+    # Calculate mean and std of CV scores for the best parameters
     cv_scores = [r['val_mae'] for r in fold_results]
     mean_cv_score = np.mean(cv_scores)
     std_cv_score = np.std(cv_scores)
+    best_fold_score = min(cv_scores)
     
     # Print summary table
     n_models_fitted = n_iter * k
-    print_cv_summary(fold_results, mean_cv_score, std_cv_score, best_score_overall, n_models_fitted)
+    print_cv_summary(fold_results, mean_cv_score, std_cv_score, best_fold_score, n_models_fitted, summary_df=summary_df)
     
     # Create an unfitted model instance with the best parameters
     best_model_unfitted = model_config['model_class'](**best_params_overall)
@@ -382,31 +429,55 @@ def cross_validate_with_tuning(X_raw, y_raw, cat_cols_list, num_cols_dict, model
         'best_estimator': best_model_unfitted,
         'mean_cv_score': mean_cv_score,
         'std_cv_score': std_cv_score,
-        'best_fold_score': best_score_overall,
-        'fold_results': fold_results
+        'best_fold_score': best_fold_score,
+        'fold_results': fold_results,
+        'results_summary': summary_df
     }
 
-def print_cv_summary(fold_results, mean_score, std_score, best_score, n_models_fitted):
-    """Prints a summary table of the cross-validation results."""
+def print_cv_summary(fold_results: list[dict], 
+                     mean_score: float, 
+                     std_score: float, 
+                     best_score: float, 
+                     n_models_fitted: int, 
+                     summary_df: pd.DataFrame | None = None) -> None:
+    """
+    Prints a summary of cross-validation results including top hyperparameters and fold performance.
+
+    Args:
+        fold_results (list[dict]): List of dictionaries containing results for each fold.
+        mean_score (float): Mean validation score across all folds.
+        std_score (float): Standard deviation of validation scores.
+        best_score (float): Best single fold validation score.
+        n_models_fitted (int): Total number of models trained during search.
+        summary_df (pd.DataFrame | None): DataFrame containing hyperparameter search results.
+    """
     print(f"Fitted {n_models_fitted} models in total.")
+    
+    if summary_df is not None:
+        print(f"\nTop 5 Hyperparameter Combinations:")
+        # Simple print of the top 5 rows, dropping the index column for cleaner output
+        print(summary_df.drop(columns=['param_idx']).round(4).head(5).to_string(index=False))
+
+    print(f"\nBest Model Performance (Across Folds):")
     print(f"{'Fold':<6} | {'Train MAE':<12} | {'Val MAE':<12}")
     print("-" * 36)
+    
     for r in fold_results:
         print(f"{r['fold']:<6} | £{r['train_mae']:<10.2f} | £{r['val_mae']:<10.2f}")
     print("-" * 36)
     print(f"Mean CV MAE: £{mean_score:.2f} ± £{std_score:.2f}")
     print(f"Best Fold MAE: £{best_score:.2f}\n")
 
-def preprocess_test_data(test_df, artifacts):
+def preprocess_test_data(test_df: pd.DataFrame, artifacts: dict) -> pd.DataFrame:
     """
     Preprocess test data using artifacts from training.
     
     Args:
-        test_df (pd.DataFrame): Raw test dataframe
-        artifacts (dict): Preprocessing artifacts from cross_validate_with_tuning
+        test_df (pd.DataFrame): Raw test dataframe.
+        artifacts (dict): Preprocessing artifacts from cross_validate_with_tuning.
         
     Returns:
-        pd.DataFrame: Preprocessed test data ready for prediction
+        pd.DataFrame: Preprocessed test data ready for prediction.
     """
     # General cleaning
     test_cleaned = general_cleaning(test_df)

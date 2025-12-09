@@ -492,3 +492,67 @@ def preprocess_test_data(test_df: pd.DataFrame, artifacts: dict) -> pd.DataFrame
     )
     
     return test_processed
+
+def get_feature_importance(fitted_model, X_train, model_class=None):
+    """
+    Extract and visualize feature importance from a fitted model.
+    
+    Extracts feature importance using the appropriate method based on model type:
+    - Tree-based models: uses feature_importances_ attribute
+    - Linear models (Ridge/Lasso): uses absolute coefficient values
+    - MLPRegressor: uses L2 norm of first layer weights
+    
+    :param fitted_model: An already-fitted model instance (Ridge, Lasso, RandomForestRegressor, 
+                        ExtraTreesRegressor, GradientBoostingRegressor, or MLPRegressor)
+    :param X_train: Training features DataFrame used for column names in visualization
+    :param model_class: Optional model class. If not provided, will be inferred from fitted_model.
+                       Useful for disambiguation if model type is ambiguous.
+    
+    :raises ValueError: If model type is not supported or lacks extractable feature importance
+    
+    :return: None (displays a bar plot of feature importance)
+    """
+
+    if model_class is None:
+        model_class = type(fitted_model)
+    
+    results = []
+
+    # Trees with feature_importances_
+    if hasattr(fitted_model, 'feature_importances_'):
+        importance = fitted_model.feature_importances_
+        criterion = getattr(fitted_model, 'criterion', 'unknown')
+        results.append((criterion, importance))
+
+    # Ridge / Lasso (based on coef)
+    elif hasattr(fitted_model, 'coef_'):
+        coef = np.abs(fitted_model.coef_)
+        if coef.ndim > 1:  
+            coef = coef.mean(axis=0)
+        results.append(("coef", coef))
+
+    # MLP - Importance based on first layer weights
+    elif model_class is MLPRegressor:
+        first_layer_weights = fitted_model.coefs_[0]     # shape = (n_features, n_hidden)
+        importance = np.linalg.norm(first_layer_weights, axis=1)
+        results.append(("mlp_weights", importance))
+
+    else:
+        raise ValueError(f"Model {model_class.__name__} not supported or has no extractable importance.")
+
+    df_list = []
+    for label, values in results:
+        df_list.append(pd.DataFrame({
+            "Feature": X_train.columns,
+            "Value": values,
+            "Method": label
+        }))
+
+    tidy = pd.concat(df_list)
+    tidy.sort_values("Value", ascending=False, inplace=True)
+
+    plt.figure(figsize=(15, 8))
+    sns.barplot(data=tidy, y="Feature", x="Value", hue="Method")
+    plt.title(f"Feature Importance — {model_class.__name__}")
+    plt.tight_layout()
+    plt.show()

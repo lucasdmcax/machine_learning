@@ -1,9 +1,12 @@
 import pandas as pd
 import numpy as np
 import nltk
+import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error
+from sklearn.neural_network import MLPRegressor
 
 def general_cleaning(df: pd.DataFrame) -> pd.DataFrame:
     """Perform general data cleaning on the DataFrame.
@@ -285,7 +288,9 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
                                num_cols_dict: dict[str, str], 
                                model_config: dict, 
                                k: int = 3, 
-                               seed: int = 42) -> dict:
+                               seed: int = 42,
+                               selected_features: list[str] | None = None,
+                               verbose: bool = True) -> dict:
     """
     Perform k-fold cross-validation with manual hyperparameter search.
     Preprocessing is done within each fold to prevent data leakage.
@@ -301,6 +306,9 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
             - 'n_iter': number of parameter settings to sample (default: 20).
         k (int): Number of CV folds (default: 3).
         seed (int): Random seed for reproducibility.
+        selected_features (list[str] | None): List of processed feature names to keep. 
+                                              If None, all features are used.
+        verbose (bool): If True, print summary of results.
         
     Returns:
         dict: Results with best_params, best_estimator, CV scores, and preprocessing artifacts.
@@ -322,7 +330,8 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
     # Store artifacts per fold to reconstruct fold_results later
     fold_artifacts_list = {}
     
-    print(f"Starting {k}-Fold CV with {model_config['model_class'].__name__} ({n_iter} hyperparam combinations)...")
+    if verbose:
+        print(f"Starting {k}-Fold CV with {model_config['model_class'].__name__} ({n_iter} hyperparam combinations)...")
     
     # Perform manual CV with preprocessing in each fold
     for fold_idx, (train_idx, val_idx) in enumerate(kfold.split(X_raw), 1):
@@ -340,6 +349,13 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
             X_val_fold, cat_cols_list, num_cols_dict, 
             artifacts=fold_artifacts, fit=False
         )
+        
+        # Filter selected features if provided
+        if selected_features is not None:
+            # Keep only features that exist in the processed data
+            cols_to_keep = [c for c in selected_features if c in X_train_processed.columns]
+            X_train_processed = X_train_processed[cols_to_keep]
+            X_val_processed = X_val_processed[cols_to_keep]
         
         fold_artifacts_list[fold_idx] = fold_artifacts
         
@@ -417,16 +433,37 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
     std_cv_score = np.std(cv_scores)
     best_fold_score = min(cv_scores)
     
+    # Refit on all data
+    if verbose:
+        print("\nRefitting best model on all available data...")
+    X_all_processed, final_artifacts = preprocess_data(
+        X_raw, cat_cols_list, num_cols_dict, fit=True
+    )
+    
+    # Filter selected features if provided
+    if selected_features is not None:
+        cols_to_keep = [c for c in selected_features if c in X_all_processed.columns]
+        X_all_processed = X_all_processed[cols_to_keep]
+        # Store selected features in artifacts for test time
+        final_artifacts['selected_features'] = cols_to_keep
+        
+    y_all_log = np.log1p(y_raw)
+    
+    final_model = model_config['model_class'](**best_params_overall)
+    final_model.fit(X_all_processed, y_all_log)
+
+    # Determine number of features selected
+    n_features_selected = X_all_processed.shape[1]
+
     # Print summary table
     n_models_fitted = n_iter * k
-    print_cv_summary(fold_results, mean_cv_score, std_cv_score, best_fold_score, n_models_fitted, summary_df=summary_df)
-    
-    # Create an unfitted model instance with the best parameters
-    best_model_unfitted = model_config['model_class'](**best_params_overall)
+    if verbose:
+        print_cv_summary(fold_results, mean_cv_score, std_cv_score, best_fold_score, n_models_fitted, summary_df=summary_df, n_features_selected=n_features_selected)
     
     return {
         'best_params': best_params_overall,
-        'best_estimator': best_model_unfitted,
+        'best_estimator': final_model,
+        'final_artifacts': final_artifacts,
         'mean_cv_score': mean_cv_score,
         'std_cv_score': std_cv_score,
         'best_fold_score': best_fold_score,
@@ -439,7 +476,8 @@ def print_cv_summary(fold_results: list[dict],
                      std_score: float, 
                      best_score: float, 
                      n_models_fitted: int, 
-                     summary_df: pd.DataFrame | None = None) -> None:
+                     summary_df: pd.DataFrame | None = None,
+                     n_features_selected: int | None = None) -> None:
     """
     Prints a summary of cross-validation results including top hyperparameters and fold performance.
 
@@ -450,9 +488,13 @@ def print_cv_summary(fold_results: list[dict],
         best_score (float): Best single fold validation score.
         n_models_fitted (int): Total number of models trained during search.
         summary_df (pd.DataFrame | None): DataFrame containing hyperparameter search results.
+        n_features_selected (int | None): Number of features selected by the final model.
     """
     print(f"Fitted {n_models_fitted} models in total.")
     
+    if n_features_selected is not None:
+        print(f"Features Selected: {n_features_selected}")
+
     if summary_df is not None:
         print(f"\nTop 5 Hyperparameter Combinations:")
         # Simple print of the top 5 rows, dropping the index column for cleaner output
@@ -491,26 +533,33 @@ def preprocess_test_data(test_df: pd.DataFrame, artifacts: dict) -> pd.DataFrame
         fit=False
     )
     
+    # Filter selected features if they were used during training
+    if 'selected_features' in artifacts:
+        cols_to_keep = [c for c in artifacts['selected_features'] if c in test_processed.columns]
+        test_processed = test_processed[cols_to_keep]
+    
     return test_processed
 
 def get_feature_importance(fitted_model, X_train, model_class=None):
-    """
-    Extract and visualize feature importance from a fitted model.
+    """Extract and visualize feature importance from a fitted model.
     
     Extracts feature importance using the appropriate method based on model type:
     - Tree-based models: uses feature_importances_ attribute
     - Linear models (Ridge/Lasso): uses absolute coefficient values
     - MLPRegressor: uses L2 norm of first layer weights
     
-    :param fitted_model: An already-fitted model instance (Ridge, Lasso, RandomForestRegressor, 
-                        ExtraTreesRegressor, GradientBoostingRegressor, or MLPRegressor)
-    :param X_train: Training features DataFrame used for column names in visualization
-    :param model_class: Optional model class. If not provided, will be inferred from fitted_model.
-                       Useful for disambiguation if model type is ambiguous.
+    Args:
+        fitted_model: An already-fitted model instance (Ridge, Lasso, RandomForestRegressor, 
+                      ExtraTreesRegressor, GradientBoostingRegressor, or MLPRegressor).
+        X_train (pd.DataFrame): Training features DataFrame used for column names in visualization.
+        model_class (type, optional): Optional model class. If not provided, will be inferred from fitted_model.
+                                      Useful for disambiguation if model type is ambiguous.
     
-    :raises ValueError: If model type is not supported or lacks extractable feature importance
+    Raises:
+        ValueError: If model type is not supported or lacks extractable feature importance.
     
-    :return: None (displays a bar plot of feature importance)
+    Returns:
+        None: Displays a bar plot of feature importance.
     """
 
     if model_class is None:

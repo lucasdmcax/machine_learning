@@ -121,7 +121,7 @@ def calculate_upper_bound(series: pd.Series) -> float:
     Q1 = series.quantile(0.25)
     Q3 = series.quantile(0.75)
     IQR = Q3 - Q1
-    return Q3 + (1.5 * IQR)
+    return Q3 + (4 * IQR)
 
 def clean_outliers(series: pd.Series, 
                    upper_bound: float,

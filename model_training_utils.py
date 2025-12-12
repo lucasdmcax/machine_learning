@@ -290,6 +290,7 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
                                k: int = 3, 
                                seed: int = 42,
                                selected_features: list[str] | None = None,
+                               log_target: bool = True,
                                verbose: bool = True) -> dict:
     """
     Perform k-fold cross-validation with manual hyperparameter search.
@@ -308,6 +309,7 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
         seed (int): Random seed for reproducibility.
         selected_features (list[str] | None): List of processed feature names to keep. 
                                               If None, all features are used.
+        log_target (bool): If True, apply log1p transform to target variable.
         verbose (bool): If True, print summary of results.
         
     Returns:
@@ -359,23 +361,34 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
         
         fold_artifacts_list[fold_idx] = fold_artifacts
         
-        # Log-transform target
-        y_train_log = np.log1p(y_train_fold)
+        # Transform target if requested
+        if log_target:
+            y_train_target = np.log1p(y_train_fold)
+        else:
+            y_train_target = y_train_fold
         
         # Evaluate each parameter combination on this fold
         for i, params in enumerate(param_combinations):
             # Train model with these parameters
             model = model_config['model_class'](**params)
-            model.fit(X_train_processed, y_train_log)
+            model.fit(X_train_processed, y_train_target)
             
             # Predict on validation fold
-            y_val_pred_log = model.predict(X_val_processed)
-            y_val_pred = np.expm1(y_val_pred_log)
+            y_val_pred_raw = model.predict(X_val_processed)
+            if log_target:
+                y_val_pred = np.expm1(y_val_pred_raw)
+            else:
+                y_val_pred = y_val_pred_raw
+                
             val_mae = mean_absolute_error(y_val_fold, y_val_pred)
             
             # Predict on train fold (for monitoring overfitting)
-            y_train_pred_log = model.predict(X_train_processed)
-            y_train_pred = np.expm1(y_train_pred_log)
+            y_train_pred_raw = model.predict(X_train_processed)
+            if log_target:
+                y_train_pred = np.expm1(y_train_pred_raw)
+            else:
+                y_train_pred = y_train_pred_raw
+                
             train_mae = mean_absolute_error(y_train_fold, y_train_pred)
             
             # Store results
@@ -447,10 +460,15 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
         # Store selected features in artifacts for test time
         final_artifacts['selected_features'] = cols_to_keep
         
-    y_all_log = np.log1p(y_raw)
+    final_artifacts['log_target'] = log_target
+        
+    if log_target:
+        y_all_target = np.log1p(y_raw)
+    else:
+        y_all_target = y_raw
     
     final_model = model_config['model_class'](**best_params_overall)
-    final_model.fit(X_all_processed, y_all_log)
+    final_model.fit(X_all_processed, y_all_target)
 
     # Determine number of features selected
     n_features_selected = X_all_processed.shape[1]

@@ -558,7 +558,7 @@ def preprocess_test_data(test_df: pd.DataFrame, artifacts: dict) -> pd.DataFrame
     
     return test_processed
 
-def get_feature_importance(fitted_model, X_train, model_class=None):
+def get_feature_importance(fitted_model, X_train, model_class=None, plot=False):
     """Extract and visualize feature importance from a fitted model.
     
     Extracts feature importance using the appropriate method based on model type:
@@ -572,12 +572,13 @@ def get_feature_importance(fitted_model, X_train, model_class=None):
         X_train (pd.DataFrame): Training features DataFrame used for column names in visualization.
         model_class (type, optional): Optional model class. If not provided, will be inferred from fitted_model.
                                       Useful for disambiguation if model type is ambiguous.
+        plot (bool): Whether to display the feature importance plot. Default is True.
     
     Raises:
         ValueError: If model type is not supported or lacks extractable feature importance.
     
     Returns:
-        None: Displays a bar plot of feature importance.
+        pd.DataFrame: DataFrame containing feature importance values.
     """
 
     if model_class is None:
@@ -618,8 +619,11 @@ def get_feature_importance(fitted_model, X_train, model_class=None):
     tidy = pd.concat(df_list)
     tidy.sort_values("Value", ascending=False, inplace=True)
 
-    plt.figure(figsize=(15, 8))
-    sns.barplot(data=tidy, y="Feature", x="Value", hue="Method")
-    plt.title(f"Feature Importance — {model_class.__name__}")
-    plt.tight_layout()
-    plt.show()
+    if plot:
+        plt.figure(figsize=(15, 8))
+        sns.barplot(data=tidy, y="Feature", x="Value", hue="Method")
+        plt.title(f"Feature Importance — {model_class.__name__}")
+        plt.tight_layout()
+        plt.show()
+    
+    return tidy

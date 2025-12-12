@@ -558,7 +558,7 @@ def preprocess_test_data(test_df: pd.DataFrame, artifacts: dict) -> pd.DataFrame
     
     return test_processed
 
-def get_feature_importance(fitted_model, X_train, model_class=None, plot=False):
+def get_feature_importance(fitted_model, X_train, model_class=None, plot=True):
     """Extract and visualize feature importance from a fitted model.
     
     Extracts feature importance using the appropriate method based on model type:

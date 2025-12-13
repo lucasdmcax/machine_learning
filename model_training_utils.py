@@ -30,6 +30,9 @@ def general_cleaning(df: pd.DataFrame) -> pd.DataFrame:
     for col in ['previousOwners', 'mileage', 'tax', 'mpg', 'engineSize']:
         df.loc[df[col] < 0, col] = np.nan
 
+    # Set zero values to NaN for engineSize (likely missing data)
+    df.loc[df['engineSize'] == 0, 'engineSize'] = np.nan
+
     for col in ['Brand', 'model', 'transmission', 'fuelType']:
         df[col] = df[col].str.lower()
         df[col] = df[col].replace('', np.nan)
@@ -180,11 +183,16 @@ def preprocess_data(X: pd.DataFrame,
     if 'year' in X.columns:
         X['age'] = 2020 - X['year']
         X = X.drop(columns=['year'])
+
+    # Log transform mileage
+    if 'mileage' in X.columns:
+        X['mileage'] = np.log1p(X['mileage'])
         
     # Update num_cols to reflect the change from year to age
     processing_num_cols = num_cols.copy()
     if 'year' in processing_num_cols:
-        processing_num_cols['age'] = processing_num_cols.pop('year')
+        processing_num_cols.pop('year')
+        processing_num_cols['age'] = 'continuous'
     
     continuous_cols = [col for col, var_type in processing_num_cols.items() if var_type == 'continuous']
     
@@ -195,13 +203,11 @@ def preprocess_data(X: pd.DataFrame,
     if fit:
         # Fit preprocessing on training data
         high_freq_cats = {col: get_categories_high_freq(X[col]) for col in cat_cols}
-        mileage_upper = X['mileage'].quantile(0.95)
         outlier_bounds = {col: calculate_upper_bound(X[col]) for col in continuous_cols}
         medians = {col: X[col].median() for col in processing_num_cols}
         
         artifacts = {
             'high_freq_cats': high_freq_cats,
-            'mileage_upper': mileage_upper,
             'outlier_bounds': outlier_bounds,
             'medians': medians,
             'cat_cols': cat_cols,
@@ -211,7 +217,6 @@ def preprocess_data(X: pd.DataFrame,
         }
     else:
         high_freq_cats = artifacts['high_freq_cats']
-        mileage_upper = artifacts['mileage_upper']
         outlier_bounds = artifacts['outlier_bounds']
         medians = artifacts['medians']
         te_cols = artifacts.get('te_cols', [])
@@ -223,11 +228,8 @@ def preprocess_data(X: pd.DataFrame,
         X[col] = X[col].fillna('other')
     
     # 2. Numerical outliers
-    X['mileage'] = clean_outliers(X['mileage'], mileage_upper, 0, return_missing=False)
-    
     for col in continuous_cols:
-        if col != 'mileage':
-            X[col] = clean_outliers(X[col], outlier_bounds[col])
+        X[col] = clean_outliers(X[col], outlier_bounds[col])
     
     # 3. Fill missing values
     for col in processing_num_cols:

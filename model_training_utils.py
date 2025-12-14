@@ -3,9 +3,6 @@ import numpy as np
 import nltk
 import matplotlib.pyplot as plt
 import seaborn as sns
-import os
-import json
-import datetime
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, TargetEncoder
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error
@@ -237,7 +234,7 @@ def preprocess_data(X: pd.DataFrame,
             X[col] = standardize_categorical_col(X[col], high_freq_cats[col])
             X[col] = X[col].fillna('other')
     else:
-        # Even if not standardizing, we might want to fill NaNs or handle new categories?
+        # Even if not standardizing, we might want to fill NaNs or handle new categories
         # For simplicity, just fill NaNs with 'other' to avoid errors in encoding
         for col in cat_cols:
             X[col] = X[col].fillna('other')

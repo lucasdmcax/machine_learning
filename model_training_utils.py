@@ -3,7 +3,7 @@ import numpy as np
 import nltk
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, TargetEncoder
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error
 from sklearn.neural_network import MLPRegressor
@@ -30,12 +30,17 @@ def general_cleaning(df: pd.DataFrame) -> pd.DataFrame:
     for col in ['previousOwners', 'mileage', 'tax', 'mpg', 'engineSize']:
         df.loc[df[col] < 0, col] = np.nan
 
+    # Set zero values to NaN for engineSize (likely missing data)
+    df.loc[df['engineSize'] == 0, 'engineSize'] = np.nan
+
     for col in ['Brand', 'model', 'transmission', 'fuelType']:
         df[col] = df[col].str.lower()
         df[col] = df[col].replace('', np.nan)
 
-    # Remove decimal part from 'year'
-    df['year'] = np.floor(df['year']).astype('Int64')
+    # Handle year/age transformation
+    if 'year' in df.columns:
+        # Remove decimal part from 'year'
+        df['year'] = np.floor(df['year']).astype('Int64')
 
     # Remove decimal part from 'previousOwners'
     df['previousOwners'] = np.floor(df['previousOwners']).astype('Int64')
@@ -121,7 +126,7 @@ def calculate_upper_bound(series: pd.Series) -> float:
     Q1 = series.quantile(0.25)
     Q3 = series.quantile(0.75)
     IQR = Q3 - Q1
-    return Q3 + (1.5 * IQR)
+    return Q3 + (4 * IQR)
 
 def clean_outliers(series: pd.Series, 
                    upper_bound: float,
@@ -156,7 +161,8 @@ def preprocess_data(X: pd.DataFrame,
                     cat_cols: list[str], 
                     num_cols: dict[str, str], 
                     artifacts: dict | None = None, 
-                    fit: bool = True) -> pd.DataFrame | tuple[pd.DataFrame, dict]:
+                    fit: bool = True,
+                    y: pd.Series | None = None) -> pd.DataFrame | tuple[pd.DataFrame, dict]:
     """
     Preprocess data using consistent transformations.
     
@@ -166,33 +172,55 @@ def preprocess_data(X: pd.DataFrame,
         num_cols (dict[str, str]): Numerical column names with types.
         artifacts (dict | None): Preprocessing artifacts (if fit=False).
         fit (bool): If True, fit transformers; if False, use provided artifacts.
+        y (pd.Series | None): Target variable for Target Encoding (required if fit=True).
         
     Returns:
         pd.DataFrame | tuple[pd.DataFrame, dict]: (X_processed, artifacts) if fit=True, else X_processed.
     """
     X = X.copy()
-    continuous_cols = [col for col, var_type in num_cols.items() if var_type == 'continuous']
+    
+    # Handle year -> age transformation
+    if 'year' in X.columns:
+        X['age'] = 2020 - X['year']
+        X = X.drop(columns=['year'])
+
+    # Log transform mileage
+    if 'mileage' in X.columns:
+        X['mileage'] = np.log1p(X['mileage'])
+        
+    # Update num_cols to reflect the change from year to age
+    processing_num_cols = num_cols.copy()
+    if 'year' in processing_num_cols:
+        processing_num_cols.pop('year')
+        processing_num_cols['age'] = 'continuous'
+    
+    continuous_cols = [col for col, var_type in processing_num_cols.items() if var_type == 'continuous']
+    
+    # Identify columns for Target Encoding vs One-Hot Encoding
+    te_cols = [col for col in cat_cols if col == 'model']
+    ohe_cols = [col for col in cat_cols if col != 'model']
     
     if fit:
         # Fit preprocessing on training data
         high_freq_cats = {col: get_categories_high_freq(X[col]) for col in cat_cols}
-        mileage_upper = X['mileage'].quantile(0.95)
         outlier_bounds = {col: calculate_upper_bound(X[col]) for col in continuous_cols}
-        medians = {col: X[col].median() for col in num_cols}
+        medians = {col: X[col].median() for col in processing_num_cols}
         
         artifacts = {
             'high_freq_cats': high_freq_cats,
-            'mileage_upper': mileage_upper,
             'outlier_bounds': outlier_bounds,
             'medians': medians,
             'cat_cols': cat_cols,
-            'num_cols': num_cols
+            'num_cols': processing_num_cols,
+            'te_cols': te_cols,
+            'ohe_cols': ohe_cols
         }
     else:
         high_freq_cats = artifacts['high_freq_cats']
-        mileage_upper = artifacts['mileage_upper']
         outlier_bounds = artifacts['outlier_bounds']
         medians = artifacts['medians']
+        te_cols = artifacts.get('te_cols', [])
+        ohe_cols = artifacts.get('ohe_cols', cat_cols)
     
     # 1. Categorical preprocessing
     for col in cat_cols:
@@ -200,36 +228,75 @@ def preprocess_data(X: pd.DataFrame,
         X[col] = X[col].fillna('other')
     
     # 2. Numerical outliers
-    X['mileage'] = clean_outliers(X['mileage'], mileage_upper, 0, return_missing=False)
-    
     for col in continuous_cols:
-        if col != 'mileage':
-            X[col] = clean_outliers(X[col], outlier_bounds[col])
+        X[col] = clean_outliers(X[col], outlier_bounds[col])
     
     # 3. Fill missing values
-    for col in num_cols:
+    for col in processing_num_cols:
         X[col] = X[col].fillna(medians[col])
     
-    # 4. One-hot encoding
-    if fit:
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-        ohe_data = pd.DataFrame(
-            ohe.fit_transform(X[cat_cols]),
-            columns=ohe.get_feature_names_out(cat_cols),
-            index=X.index
-        )
-        artifacts['encoder'] = ohe
-    else:
-        ohe_data = pd.DataFrame(
-            artifacts['encoder'].transform(X[cat_cols]),
-            columns=artifacts['encoder'].get_feature_names_out(cat_cols),
-            index=X.index
-        )
+    # 4. Encoding
+    encoded_dfs = []
+
+    # Target Encoding
+    if te_cols:
+        if fit:
+            if y is None:
+                raise ValueError("Target variable 'y' is required for fitting TargetEncoder.")
+            te = TargetEncoder(target_type='continuous', smooth="auto")
+            te_data = pd.DataFrame(
+                te.fit_transform(X[te_cols], y),
+                columns=te.get_feature_names_out(te_cols),
+                index=X.index
+            )
+            artifacts['target_encoder'] = te
+        else:
+            te = artifacts.get('target_encoder')
+            if te:
+                te_data = pd.DataFrame(
+                    te.transform(X[te_cols]),
+                    columns=te.get_feature_names_out(te_cols),
+                    index=X.index
+                )
+            else:
+                te_data = pd.DataFrame()
+        encoded_dfs.append(te_data)
+
+    # One-Hot Encoding
+    if ohe_cols:
+        if fit:
+            ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+            ohe_data = pd.DataFrame(
+                ohe.fit_transform(X[ohe_cols]),
+                columns=ohe.get_feature_names_out(ohe_cols),
+                index=X.index
+            )
+            artifacts['encoder'] = ohe
+        else:
+            ohe = artifacts['encoder']
+            ohe_data = pd.DataFrame(
+                ohe.transform(X[ohe_cols]),
+                columns=ohe.get_feature_names_out(ohe_cols),
+                index=X.index
+            )
+        
+        # Filter out 'other' columns generated by OHE
+        cols_to_drop = [col for col in ohe_data.columns if col.endswith('_other')]
+        ohe_data = ohe_data.drop(columns=cols_to_drop)
+        
+        encoded_dfs.append(ohe_data)
     
-    X = pd.concat([X.drop(columns=cat_cols), ohe_data], axis=1)
+    X = X.drop(columns=cat_cols)
+    if encoded_dfs:
+        X = pd.concat([X] + encoded_dfs, axis=1)
     
     # 5. Normalize numerical features
-    numerical_cols = list(num_cols.keys())
+    numerical_cols = list(processing_num_cols.keys())
+    
+    # Add target encoded columns to normalization
+    if te_cols:
+        numerical_cols.extend(te_cols)
+
     if fit:
         scaler = StandardScaler()
         X[numerical_cols] = scaler.fit_transform(X[numerical_cols])
@@ -290,6 +357,7 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
                                k: int = 3, 
                                seed: int = 42,
                                selected_features: list[str] | None = None,
+                               log_target: bool = True,
                                verbose: bool = True) -> dict:
     """
     Perform k-fold cross-validation with manual hyperparameter search.
@@ -308,6 +376,7 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
         seed (int): Random seed for reproducibility.
         selected_features (list[str] | None): List of processed feature names to keep. 
                                               If None, all features are used.
+        log_target (bool): If True, apply log1p transform to target variable.
         verbose (bool): If True, print summary of results.
         
     Returns:
@@ -343,7 +412,7 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
         
         # Preprocess data for this fold
         X_train_processed, fold_artifacts = preprocess_data(
-            X_train_fold, cat_cols_list, num_cols_dict, fit=True
+            X_train_fold, cat_cols_list, num_cols_dict, fit=True, y=y_train_fold
         )
         X_val_processed = preprocess_data(
             X_val_fold, cat_cols_list, num_cols_dict, 
@@ -359,23 +428,34 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
         
         fold_artifacts_list[fold_idx] = fold_artifacts
         
-        # Log-transform target
-        y_train_log = np.log1p(y_train_fold)
+        # Transform target if requested
+        if log_target:
+            y_train_target = np.log1p(y_train_fold)
+        else:
+            y_train_target = y_train_fold
         
         # Evaluate each parameter combination on this fold
         for i, params in enumerate(param_combinations):
             # Train model with these parameters
             model = model_config['model_class'](**params)
-            model.fit(X_train_processed, y_train_log)
+            model.fit(X_train_processed, y_train_target)
             
             # Predict on validation fold
-            y_val_pred_log = model.predict(X_val_processed)
-            y_val_pred = np.expm1(y_val_pred_log)
+            y_val_pred_raw = model.predict(X_val_processed)
+            if log_target:
+                y_val_pred = np.expm1(y_val_pred_raw)
+            else:
+                y_val_pred = y_val_pred_raw
+                
             val_mae = mean_absolute_error(y_val_fold, y_val_pred)
             
             # Predict on train fold (for monitoring overfitting)
-            y_train_pred_log = model.predict(X_train_processed)
-            y_train_pred = np.expm1(y_train_pred_log)
+            y_train_pred_raw = model.predict(X_train_processed)
+            if log_target:
+                y_train_pred = np.expm1(y_train_pred_raw)
+            else:
+                y_train_pred = y_train_pred_raw
+                
             train_mae = mean_absolute_error(y_train_fold, y_train_pred)
             
             # Store results
@@ -437,7 +517,7 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
     if verbose:
         print("\nRefitting best model on all available data...")
     X_all_processed, final_artifacts = preprocess_data(
-        X_raw, cat_cols_list, num_cols_dict, fit=True
+        X_raw, cat_cols_list, num_cols_dict, fit=True, y=y_raw
     )
     
     # Filter selected features if provided
@@ -447,10 +527,15 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
         # Store selected features in artifacts for test time
         final_artifacts['selected_features'] = cols_to_keep
         
-    y_all_log = np.log1p(y_raw)
+    final_artifacts['log_target'] = log_target
+        
+    if log_target:
+        y_all_target = np.log1p(y_raw)
+    else:
+        y_all_target = y_raw
     
     final_model = model_config['model_class'](**best_params_overall)
-    final_model.fit(X_all_processed, y_all_log)
+    final_model.fit(X_all_processed, y_all_target)
 
     # Determine number of features selected
     n_features_selected = X_all_processed.shape[1]
@@ -458,7 +543,15 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
     # Print summary table
     n_models_fitted = n_iter * k
     if verbose:
-        print_cv_summary(fold_results, mean_cv_score, std_cv_score, best_fold_score, n_models_fitted, summary_df=summary_df, n_features_selected=n_features_selected)
+        print_cv_summary(
+            fold_results,
+            mean_cv_score,
+            std_cv_score,
+            best_fold_score,
+            n_models_fitted,
+            summary_df=summary_df,
+            n_features_selected=n_features_selected
+        )
     
     return {
         'best_params': best_params_overall,
@@ -540,7 +633,7 @@ def preprocess_test_data(test_df: pd.DataFrame, artifacts: dict) -> pd.DataFrame
     
     return test_processed
 
-def get_feature_importance(fitted_model, X_train, model_class=None):
+def get_feature_importance(fitted_model, X_train, model_class=None, plot=True, ax=None):
     """Extract and visualize feature importance from a fitted model.
     
     Extracts feature importance using the appropriate method based on model type:
@@ -554,12 +647,14 @@ def get_feature_importance(fitted_model, X_train, model_class=None):
         X_train (pd.DataFrame): Training features DataFrame used for column names in visualization.
         model_class (type, optional): Optional model class. If not provided, will be inferred from fitted_model.
                                       Useful for disambiguation if model type is ambiguous.
+        plot (bool): Whether to display the feature importance plot. Default is True.
+        ax (matplotlib.axes.Axes, optional): Axes object to draw the plot onto, otherwise uses the current figure.
     
     Raises:
         ValueError: If model type is not supported or lacks extractable feature importance.
     
     Returns:
-        None: Displays a bar plot of feature importance.
+        pd.DataFrame: DataFrame containing feature importance values.
     """
 
     if model_class is None:
@@ -598,10 +693,21 @@ def get_feature_importance(fitted_model, X_train, model_class=None):
         }))
 
     tidy = pd.concat(df_list)
+    
+    # Filter out "other" columns generated by OHE
+    tidy = tidy[~tidy['Feature'].str.endswith('_other')]
+    
     tidy.sort_values("Value", ascending=False, inplace=True)
 
-    plt.figure(figsize=(15, 8))
-    sns.barplot(data=tidy, y="Feature", x="Value", hue="Method")
-    plt.title(f"Feature Importance — {model_class.__name__}")
-    plt.tight_layout()
-    plt.show()
+    if plot:
+        if ax is None:
+            plt.figure(figsize=(15, 8))
+            ax = plt.gca()
+        
+        sns.barplot(data=tidy, y="Feature", x="Value", hue="Method", ax=ax)
+        ax.set_title(f"Feature Importance — {model_class.__name__}")
+        if ax is None:
+            plt.tight_layout()
+            plt.show()
+    
+    return tidy

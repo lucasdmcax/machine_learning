@@ -162,7 +162,10 @@ def preprocess_data(X: pd.DataFrame,
                     num_cols: dict[str, str], 
                     artifacts: dict | None = None, 
                     fit: bool = True,
-                    y: pd.Series | None = None) -> pd.DataFrame | tuple[pd.DataFrame, dict]:
+                    y: pd.Series | None = None,
+                    clean_outliers_flag: bool = True,
+                    standardize_cats_flag: bool = True,
+                    normalize_flag: bool = True) -> pd.DataFrame | tuple[pd.DataFrame, dict]:
     """
     Preprocess data using consistent transformations.
     
@@ -173,6 +176,9 @@ def preprocess_data(X: pd.DataFrame,
         artifacts (dict | None): Preprocessing artifacts (if fit=False).
         fit (bool): If True, fit transformers; if False, use provided artifacts.
         y (pd.Series | None): Target variable for Target Encoding (required if fit=True).
+        clean_outliers_flag (bool): If True, perform outlier cleaning.
+        standardize_cats_flag (bool): If True, perform categorical standardization.
+        normalize_flag (bool): If True, perform numerical normalization.
         
     Returns:
         pd.DataFrame | tuple[pd.DataFrame, dict]: (X_processed, artifacts) if fit=True, else X_processed.
@@ -223,13 +229,20 @@ def preprocess_data(X: pd.DataFrame,
         ohe_cols = artifacts.get('ohe_cols', cat_cols)
     
     # 1. Categorical preprocessing
-    for col in cat_cols:
-        X[col] = standardize_categorical_col(X[col], high_freq_cats[col])
-        X[col] = X[col].fillna('other')
+    if standardize_cats_flag:
+        for col in cat_cols:
+            X[col] = standardize_categorical_col(X[col], high_freq_cats[col])
+            X[col] = X[col].fillna('other')
+    else:
+        # Even if not standardizing, we might want to fill NaNs or handle new categories
+        # For simplicity, just fill NaNs with 'other' to avoid errors in encoding
+        for col in cat_cols:
+            X[col] = X[col].fillna('other')
     
     # 2. Numerical outliers
-    for col in continuous_cols:
-        X[col] = clean_outliers(X[col], outlier_bounds[col])
+    if clean_outliers_flag:
+        for col in continuous_cols:
+            X[col] = clean_outliers(X[col], outlier_bounds[col])
     
     # 3. Fill missing values
     for col in processing_num_cols:
@@ -291,18 +304,19 @@ def preprocess_data(X: pd.DataFrame,
         X = pd.concat([X] + encoded_dfs, axis=1)
     
     # 5. Normalize numerical features
-    numerical_cols = list(processing_num_cols.keys())
-    
-    # Add target encoded columns to normalization
-    if te_cols:
-        numerical_cols.extend(te_cols)
+    if normalize_flag:
+        numerical_cols = list(processing_num_cols.keys())
+        
+        # Add target encoded columns to normalization
+        if te_cols:
+            numerical_cols.extend(te_cols)
 
-    if fit:
-        scaler = StandardScaler()
-        X[numerical_cols] = scaler.fit_transform(X[numerical_cols])
-        artifacts['scaler'] = scaler
-    else:
-        X[numerical_cols] = artifacts['scaler'].transform(X[numerical_cols])
+        if fit:
+            scaler = StandardScaler()
+            X[numerical_cols] = scaler.fit_transform(X[numerical_cols])
+            artifacts['scaler'] = scaler
+        else:
+            X[numerical_cols] = artifacts['scaler'].transform(X[numerical_cols])
     
     return (X, artifacts) if fit else X
 
@@ -358,7 +372,8 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
                                seed: int = 42,
                                selected_features: list[str] | None = None,
                                log_target: bool = True,
-                               verbose: bool = True) -> dict:
+                               verbose: bool = True,
+                               preprocessing_params: dict | None = None) -> dict:
     """
     Perform k-fold cross-validation with manual hyperparameter search.
     Preprocessing is done within each fold to prevent data leakage.
@@ -378,6 +393,7 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
                                               If None, all features are used.
         log_target (bool): If True, apply log1p transform to target variable.
         verbose (bool): If True, print summary of results.
+        preprocessing_params (dict | None): Optional dictionary of flags to pass to preprocess_data.
         
     Returns:
         dict: Results with best_params, best_estimator, CV scores, and preprocessing artifacts.
@@ -399,6 +415,9 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
     # Store artifacts per fold to reconstruct fold_results later
     fold_artifacts_list = {}
     
+    if preprocessing_params is None:
+        preprocessing_params = {}
+    
     if verbose:
         print(f"Starting {k}-Fold CV with {model_config['model_class'].__name__} ({n_iter} hyperparam combinations)...")
     
@@ -412,11 +431,11 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
         
         # Preprocess data for this fold
         X_train_processed, fold_artifacts = preprocess_data(
-            X_train_fold, cat_cols_list, num_cols_dict, fit=True, y=y_train_fold
+            X_train_fold, cat_cols_list, num_cols_dict, fit=True, y=y_train_fold, **preprocessing_params
         )
         X_val_processed = preprocess_data(
             X_val_fold, cat_cols_list, num_cols_dict, 
-            artifacts=fold_artifacts, fit=False
+            artifacts=fold_artifacts, fit=False, **preprocessing_params
         )
         
         # Filter selected features if provided
@@ -517,7 +536,7 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
     if verbose:
         print("\nRefitting best model on all available data...")
     X_all_processed, final_artifacts = preprocess_data(
-        X_raw, cat_cols_list, num_cols_dict, fit=True, y=y_raw
+        X_raw, cat_cols_list, num_cols_dict, fit=True, y=y_raw, **preprocessing_params
     )
     
     # Filter selected features if provided
@@ -528,6 +547,8 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
         final_artifacts['selected_features'] = cols_to_keep
         
     final_artifacts['log_target'] = log_target
+    # Store preprocessing params in artifacts for test time
+    final_artifacts['preprocessing_params'] = preprocessing_params
         
     if log_target:
         y_all_target = np.log1p(y_raw)
@@ -617,13 +638,17 @@ def preprocess_test_data(test_df: pd.DataFrame, artifacts: dict) -> pd.DataFrame
     # General cleaning
     test_cleaned = general_cleaning(test_df)
     
+    # Extract preprocessing flags from artifacts if available, otherwise default to True
+    preprocessing_params = artifacts.get('preprocessing_params', {})
+    
     # Apply preprocessing using artifacts
     test_processed = preprocess_data(
         test_cleaned, 
         artifacts['cat_cols'], 
         artifacts['num_cols'], 
         artifacts=artifacts, 
-        fit=False
+        fit=False,
+        **preprocessing_params
     )
     
     # Filter selected features if they were used during training

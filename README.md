@@ -79,7 +79,7 @@ We implemented a robust pipeline that treats preprocessing steps as hyperparamet
 
 ### Key Preprocessing Steps
 1.  **Categorical Standardization**: Uses Levenshtein distance to merge typos (e.g., "Mercedes-Benz" vs "Mercedes Benz").
-2.  **Outlier Handling**: Clips or removes values exceeding  + 1.5 \times IQR$.
+2.  **Outlier Handling**: Clips or removes values exceeding  + $4 \times IQR$.
 3.  **Target Encoding**: Encodes high-cardinality features (like `model`) based on the target mean, with smoothing to prevent overfitting.
 4.  **Log Transformation**: Applies `log1p` to skewed features (`mileage`) and optionally to the target variable (`price`).
 

@@ -42,7 +42,6 @@ To address this, the company has reached out to us. Their main goal is to expedi
 │   ├── test.csv              # Test data (features only)
 │   ├── sample_submission.csv # Submission format
 │   └── ...
-└── __pycache__/              # Compiled Python files
 ```
 
 ### Key Files

@@ -23,7 +23,7 @@ To address this, the company has reached out to us. Their main goal is to expedi
 
 ## Objectives
 - **Build and compare regression models** for car price prediction.
-- **Evaluate model performance** using metrics such as MAE, RMSE, and R².
+- **Evaluate model performance** using metrics such as MAE.
 - **Optimize the best-performing model** through rigorous hyperparameter tuning and ablation analysis.
 
 ---
@@ -122,7 +122,7 @@ results = cross_validate_with_tuning(
 
 ## Results
 
-After training approximately **780 models** across various algorithms (Ridge, Lasso, Random Forest, Gradient Boosting, MLP), our analysis yielded the following insights:
+After training approximately **720 models** across various algorithms (Ridge, Lasso, Random Forest, Gradient Boosting, MLP), our analysis yielded the following insights:
 
 *   **Best Model**: `HistGradientBoostingRegressor` achieved the lowest MAE on the validation set.
 *   **Log-Transformation**: Critical for linear models (Ridge/Lasso) but showed mixed results for ensemble methods.

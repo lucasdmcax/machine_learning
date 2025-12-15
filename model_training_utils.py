@@ -3,10 +3,21 @@ import numpy as np
 import nltk
 import matplotlib.pyplot as plt
 import seaborn as sns
+from functools import lru_cache
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, TargetEncoder
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error
 from sklearn.neural_network import MLPRegressor
+from sklearn.feature_selection import SelectKBest, f_regression
+
+@lru_cache(maxsize=None)
+def cached_edit_distance(s1: str, s2: str) -> int:
+    """
+    Wrapper around nltk.edit_distance with caching to speed up repeated calls.
+    Since the set of car models is finite, this avoids re-calculating the same
+    distances millions of times during CV.
+    """
+    return nltk.edit_distance(s1, s2)
 
 def general_cleaning(df: pd.DataFrame) -> pd.DataFrame:
     """Perform general data cleaning on the DataFrame.
@@ -61,7 +72,7 @@ def standardize_categorical_col(series: pd.Series,
     1. Maps values to a standard category if they are a likely typo
        (i.e., within the edit distance_threshold).
     2. Keeps values that are already in the standard list.
-    3. Groups all other values that don't match into an 'other' bin.
+    3. Keeps other values as is (instead of grouping into 'other').
     
     Args:
         series (pd.Series): The categorical column to standardize.
@@ -73,6 +84,10 @@ def standardize_categorical_col(series: pd.Series,
         pd.Series: The standardized categorical column.
     """
     
+    # If no standard categories provided, return original series
+    if not standardised_cats:
+        return series
+
     # 1. Get all unique non-null values from the series
     unique_values = series.dropna().unique()
     
@@ -88,24 +103,24 @@ def standardize_categorical_col(series: pd.Series,
             continue
 
         # Find the closest match and its distance
-        distances = [nltk.edit_distance(x_str, cat) for cat in standardised_cats]
+        distances = [cached_edit_distance(x_str, cat) for cat in standardised_cats]
         min_distance = np.min(distances)
         
         if min_distance <= distance_threshold:
             closest_cat = standardised_cats[np.argmin(distances)]
             mapping[x] = closest_cat
         else:
-            mapping[x] = 'other'
+            mapping[x] = x_str # Keep original
             
     return series.map(mapping)
 
-def get_categories_high_freq(series: pd.Series, percent_threshold: float = 0.02) -> list[str]:
+def get_categories_high_freq(series: pd.Series, percent_threshold: float = 0.001) -> list[str]:
     """Get categories that appear more than a dynamic percentage threshold.
     
     Args:
         series (pd.Series): The categorical series to analyze.
         percent_threshold (float): The minimum percentage of total rows a category
-                                   must have to be included (e.g., 0.01 for 1%).
+                                   must have to be included (e.g., 0.001 for 0.1%).
                                    
     Returns:
         list[str]: List of categories with frequency above the dynamic threshold.
@@ -378,6 +393,9 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
     Perform k-fold cross-validation with manual hyperparameter search.
     Preprocessing is done within each fold to prevent data leakage.
     
+    Supports tuning preprocessing parameters and log_target if they are included
+    in model_config['param_distributions'].
+    
     Args:
         X_raw (pd.DataFrame): Raw training features (not preprocessed).
         y_raw (pd.Series): Raw training target (not log-transformed).
@@ -391,9 +409,9 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
         seed (int): Random seed for reproducibility.
         selected_features (list[str] | None): List of processed feature names to keep. 
                                               If None, all features are used.
-        log_target (bool): If True, apply log1p transform to target variable.
+        log_target (bool): Default value for log_target if not in param_distributions.
         verbose (bool): If True, print summary of results.
-        preprocessing_params (dict | None): Optional dictionary of flags to pass to preprocess_data.
+        preprocessing_params (dict | None): Default preprocessing flags if not in param_distributions.
         
     Returns:
         dict: Results with best_params, best_estimator, CV scores, and preprocessing artifacts.
@@ -413,15 +431,13 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
     param_results = {i: {'params': params, 'fold_scores': []} for i, params in enumerate(param_combinations)}
     
     # Store artifacts per fold to reconstruct fold_results later
-    fold_artifacts_list = {}
-    
-    if preprocessing_params is None:
-        preprocessing_params = {}
+    # Note: With varying preprocessing, artifacts depend on params AND fold.
+    # We will store the artifacts for the BEST params later.
     
     if verbose:
         print(f"Starting {k}-Fold CV with {model_config['model_class'].__name__} ({n_iter} hyperparam combinations)...")
     
-    # Perform manual CV with preprocessing in each fold
+    # Perform manual CV
     for fold_idx, (train_idx, val_idx) in enumerate(kfold.split(X_raw), 1):
         # Split data for this fold
         X_train_fold = X_raw.iloc[train_idx].copy()
@@ -429,39 +445,81 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
         y_train_fold = y_raw.iloc[train_idx].copy()
         y_val_fold = y_raw.iloc[val_idx].copy()
         
-        # Preprocess data for this fold
-        X_train_processed, fold_artifacts = preprocess_data(
-            X_train_fold, cat_cols_list, num_cols_dict, fit=True, y=y_train_fold, **preprocessing_params
-        )
-        X_val_processed = preprocess_data(
-            X_val_fold, cat_cols_list, num_cols_dict, 
-            artifacts=fold_artifacts, fit=False, **preprocessing_params
-        )
-        
-        # Filter selected features if provided
-        if selected_features is not None:
-            # Keep only features that exist in the processed data
-            cols_to_keep = [c for c in selected_features if c in X_train_processed.columns]
-            X_train_processed = X_train_processed[cols_to_keep]
-            X_val_processed = X_val_processed[cols_to_keep]
-        
-        fold_artifacts_list[fold_idx] = fold_artifacts
-        
-        # Transform target if requested
-        if log_target:
-            y_train_target = np.log1p(y_train_fold)
-        else:
-            y_train_target = y_train_fold
-        
         # Evaluate each parameter combination on this fold
         for i, params in enumerate(param_combinations):
+            
+            # 1. Determine Preprocessing Params
+            current_preprocessing_params = preprocessing_params.copy() if preprocessing_params else {}
+            
+            # Set defaults if not provided
+            defaults = {
+                'clean_outliers_flag': True,
+                'standardize_cats_flag': True,
+                'normalize_flag': True
+            }
+            for key, val in defaults.items():
+                if key not in current_preprocessing_params:
+                    current_preprocessing_params[key] = val
+                    
+            # Override with sampled params
+            pipeline_keys = ['clean_outliers_flag', 'standardize_cats_flag', 'normalize_flag']
+            for key in pipeline_keys:
+                if key in params:
+                    current_preprocessing_params[key] = params[key]
+            
+            # 2. Determine Log Target
+            current_log_target = log_target
+            if 'log_target' in params:
+                current_log_target = params['log_target']
+                
+            # 3. Determine Model Params
+            model_params = {k: v for k, v in params.items() if k not in pipeline_keys and k != 'log_target' and k != 'feature_selection_k'}
+            
+            # Preprocess data for this fold AND this param combination
+            X_train_processed, fold_artifacts = preprocess_data(
+                X_train_fold, cat_cols_list, num_cols_dict, fit=True, y=y_train_fold, **current_preprocessing_params
+            )
+            X_val_processed = preprocess_data(
+                X_val_fold, cat_cols_list, num_cols_dict, 
+                artifacts=fold_artifacts, fit=False, **current_preprocessing_params
+            )
+            
+            # Filter selected features if provided (static selection)
+            if selected_features is not None:
+                # Keep only features that exist in the processed data
+                cols_to_keep = [c for c in selected_features if c in X_train_processed.columns]
+                X_train_processed = X_train_processed[cols_to_keep]
+                X_val_processed = X_val_processed[cols_to_keep]
+
+            # Transform target if requested
+            if current_log_target:
+                y_train_target = np.log1p(y_train_fold)
+            else:
+                y_train_target = y_train_fold
+
+            # 4. Dynamic Feature Selection (inside fold)
+            current_k = params.get('feature_selection_k', None)
+            if current_k is not None:
+                # Ensure k is not larger than number of features
+                k_val = min(int(current_k), X_train_processed.shape[1])
+                
+                selector = SelectKBest(f_regression, k=k_val)
+                selector.fit(X_train_processed, y_train_target)
+                
+                # Get selected feature names
+                selected_mask = selector.get_support()
+                selected_cols = X_train_processed.columns[selected_mask].tolist()
+                
+                X_train_processed = X_train_processed[selected_cols]
+                X_val_processed = X_val_processed[selected_cols]
+            
             # Train model with these parameters
-            model = model_config['model_class'](**params)
+            model = model_config['model_class'](**model_params)
             model.fit(X_train_processed, y_train_target)
             
             # Predict on validation fold
             y_val_pred_raw = model.predict(X_val_processed)
-            if log_target:
+            if current_log_target:
                 y_val_pred = np.expm1(y_val_pred_raw)
             else:
                 y_val_pred = y_val_pred_raw
@@ -470,7 +528,7 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
             
             # Predict on train fold (for monitoring overfitting)
             y_train_pred_raw = model.predict(X_train_processed)
-            if log_target:
+            if current_log_target:
                 y_train_pred = np.expm1(y_train_pred_raw)
             else:
                 y_train_pred = y_train_pred_raw
@@ -481,7 +539,10 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
             param_results[i]['fold_scores'].append({
                 'fold': fold_idx,
                 'val_mae': val_mae,
-                'train_mae': train_mae
+                'train_mae': train_mae,
+                # We don't store artifacts here to save memory, but we need them for the best model later.
+                # Since we refit on all data, we don't strictly need fold artifacts for the return value,
+                # except for the 'fold_results' display.
             })
 
     # Calculate stats for all parameter combinations
@@ -513,17 +574,16 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
     
     best_scores = param_results[best_param_idx]['fold_scores']
     
-    # Construct fold_results for the best parameter set (for display/return)
+    # Construct fold_results for the best parameter set
     fold_results = []
     for score_data in best_scores:
-        fold_idx = score_data['fold']
         fold_results.append({
-            'fold': fold_idx,
-            'best_params': best_params_overall, # Same for all folds now
+            'fold': score_data['fold'],
+            'best_params': best_params_overall,
             'train_mae': score_data['train_mae'],
             'val_mae': score_data['val_mae'],
-            'best_model': None, # We don't keep the fitted models to save memory
-            'artifacts': fold_artifacts_list[fold_idx]
+            'best_model': None, 
+            'artifacts': None # We didn't save them per fold to save memory/complexity
         })
         
     # Calculate mean and std of CV scores for the best parameters
@@ -532,30 +592,69 @@ def cross_validate_with_tuning(X_raw: pd.DataFrame,
     std_cv_score = np.std(cv_scores)
     best_fold_score = min(cv_scores)
     
-    # Refit on all data
+    # Refit on all data using BEST parameters
     if verbose:
         print("\nRefitting best model on all available data...")
+        
+    # Extract best pipeline params
+    best_pipeline_params = preprocessing_params.copy() if preprocessing_params else {}
+    defaults = {
+        'clean_outliers_flag': True,
+        'standardize_cats_flag': True,
+        'normalize_flag': True
+    }
+    for key, val in defaults.items():
+        if key not in best_pipeline_params:
+            best_pipeline_params[key] = val
+            
+    pipeline_keys = ['clean_outliers_flag', 'standardize_cats_flag', 'normalize_flag']
+    for key in pipeline_keys:
+        if key in best_params_overall:
+            best_pipeline_params[key] = best_params_overall[key]
+            
+    best_log_target = log_target
+    if 'log_target' in best_params_overall:
+        best_log_target = best_params_overall['log_target']
+        
+    best_model_params = {k: v for k, v in best_params_overall.items() if k not in pipeline_keys and k != 'log_target' and k != 'feature_selection_k'}
+
     X_all_processed, final_artifacts = preprocess_data(
-        X_raw, cat_cols_list, num_cols_dict, fit=True, y=y_raw, **preprocessing_params
+        X_raw, cat_cols_list, num_cols_dict, fit=True, y=y_raw, **best_pipeline_params
     )
     
-    # Filter selected features if provided
+    # Filter selected features if provided (static)
     if selected_features is not None:
         cols_to_keep = [c for c in selected_features if c in X_all_processed.columns]
         X_all_processed = X_all_processed[cols_to_keep]
         # Store selected features in artifacts for test time
         final_artifacts['selected_features'] = cols_to_keep
         
-    final_artifacts['log_target'] = log_target
+    final_artifacts['log_target'] = best_log_target
     # Store preprocessing params in artifacts for test time
-    final_artifacts['preprocessing_params'] = preprocessing_params
+    final_artifacts['preprocessing_params'] = best_pipeline_params
         
-    if log_target:
+    if best_log_target:
         y_all_target = np.log1p(y_raw)
     else:
         y_all_target = y_raw
+
+    # Apply Dynamic Feature Selection on all data if it was part of best params
+    best_k = best_params_overall.get('feature_selection_k', None)
+    if best_k is not None:
+        k_val = min(int(best_k), X_all_processed.shape[1])
+        
+        selector = SelectKBest(f_regression, k=k_val)
+        selector.fit(X_all_processed, y_all_target)
+        
+        selected_mask = selector.get_support()
+        selected_cols = X_all_processed.columns[selected_mask].tolist()
+        
+        X_all_processed = X_all_processed[selected_cols]
+        
+        # Update artifacts so test data is filtered correctly
+        final_artifacts['selected_features'] = selected_cols
     
-    final_model = model_config['model_class'](**best_params_overall)
+    final_model = model_config['model_class'](**best_model_params)
     final_model.fit(X_all_processed, y_all_target)
 
     # Determine number of features selected

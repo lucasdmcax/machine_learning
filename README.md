@@ -25,7 +25,6 @@ To address this, the company has reached out to us. Their main goal is to expedi
 - **Build and compare regression models** for car price prediction.
 - **Evaluate model performance** using metrics such as MAE, RMSE, and R².
 - **Optimize the best-performing model** through rigorous hyperparameter tuning and ablation analysis.
-- **Deploy a scalable system** that can handle raw input data and generate predictions in real-time.
 
 ---
 
@@ -41,7 +40,6 @@ To address this, the company has reached out to us. Their main goal is to expedi
 │   ├── train.csv             # Training data
 │   ├── test.csv              # Test data (features only)
 │   ├── sample_submission.csv # Submission format
-│   └── ...
 ```
 
 ### Key Files
